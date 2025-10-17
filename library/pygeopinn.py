@@ -23,13 +23,21 @@ class pygeopinn:
     `pygeopinn` is a library to ease the use of neural networks in order to solve
     the inverse geodynamo problem. The problem is solved in the physical domain.
     Along with the azimuthal and polar components of the flow, the magnetic field
-    is co-estimated. Each field is represented by a small network, which is trained
-    along the other ones with the same loss function.
-    """
+    is co-estimated.
+    """    
     class __network__(nn.Module):
         """
         Nested class for creating a single neural network.
         """
+        class Sine(nn.Module):
+            """
+            Creating the Sine activation function
+            """
+            def __init__(self):
+                super().__init__()
+            def forward(self, x):
+                return sin(x)
+            
         def __init__(self, nb_layers: int, nb_neurons: int) -> None:
             """
             Initializing the network.
@@ -43,15 +51,15 @@ class pygeopinn:
 
             # Creating the first layer
             layers.append(nn.Linear(2, nb_neurons, dtype=float32))
-            layers.append(nn.Tanh())
+            layers.append(self.Sine())
 
             # Creating the hidden layers
-            for layer in range(nb_layers):
+            for _ in range(nb_layers):
                 layers.append(nn.Linear(nb_neurons, nb_neurons, dtype=float32))
-                layers.append(nn.Tanh())
+                layers.append(self.Sine())
 
             # Creating the last layer
-            layers.append(nn.Linear(nb_neurons, 1, dtype=float32))
+            layers.append(nn.Linear(nb_neurons, 3, dtype=float32))
 
             # Creating the network
             self.net = nn.Sequential(*layers)
@@ -71,14 +79,12 @@ class pygeopinn:
 
     def __init__(self, nb_layers: int = 5, nb_neurons: int = 32, verbose: bool = True) -> None:
         r"""
-        Initializing the library, and the networks.
+        Initializing the library, and the network.
         - (int) `nb_layers` the number of hidden layers (default: 5)
         - (int) `nb_neurons` the number of neurons (default: 32)
         - (bool) `verbose` enable the verbose mode (default: true)
         """
-        self.br_network = self.__network__(nb_layers, nb_neurons)
-        self.t_network = self.__network__(nb_layers, nb_neurons)
-        self.s_network = self.__network__(nb_layers, nb_neurons)
+        self.network = self.__network__(nb_layers, nb_neurons)
 
         self.nb_layers = nb_layers
         self.nb_neurons = nb_neurons
@@ -158,6 +164,9 @@ class pygeopinn:
 
         thetas_grid, phis_grid = meshgrid(self.grid["thetas"], self.grid["phis"], indexing="ij")
 
+        # Useful for reshaping torch's squeezed fields later
+        self.shape = thetas_grid.shape
+
         self.tensors.update({
             "thetas": self._array_to_tensor(thetas_grid.reshape(-1, 1)),
             "phis": self._array_to_tensor(phis_grid.reshape(-1, 1))
@@ -174,9 +183,7 @@ class pygeopinn:
         - (int) `nb_epochs` the number of epochs.
         - (bool) `init` initializing before starting the training
         """
-        self.br_network.train()
-        self.t_network.train()
-        self.s_network.train()
+        self.network.train()
 
         if init:
             self.lower_loss = float('inf')
@@ -184,7 +191,7 @@ class pygeopinn:
 
         # TODO: Check if everything is ready before starting
 
-        optimizer = optim.AdamW([*self.br_network.parameters(), *self.t_network.parameters(), *self.s_network.parameters()])
+        optimizer = optim.AdamW(self.network.parameters())
         scaler = amp.GradScaler("cpu")
 
         tqdm_format = "{percentage:3.2f}% ({remaining} remaining) | Loss = {postfix[0]:.3E}"
@@ -195,41 +202,40 @@ class pygeopinn:
 
                 # Mixed precision to speed up calculations
                 with autocast(device_type="cpu", dtype=bfloat16, enabled=True):
-                    br_pred = 1e6 * self.br_network(self.inputs)
-                    t_pred = self.t_network(self.inputs)
-                    s_pred = self.s_network(self.inputs)
-
-                    loss = self.loss(br_pred, t_pred, s_pred)
+                    loss = self.loss(self.inputs)
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
 
-                nn.utils.clip_grad_norm_([*self.br_network.parameters(), *self.t_network.parameters(), *self.s_network.parameters()], 1)
+                nn.utils.clip_grad_norm_(self.network.parameters(), 1)
 
                 scaler.step(optimizer)
                 scaler.update()
 
                 with no_grad():
                     if loss.item() < self.lower_loss:
-                        save(self.br_network.state_dict(), "best_br_network.pt")
-                        save(self.t_network.state_dict(), "best_t_network.pt")
-                        save(self.s_network.state_dict(), "best_s_network.pt")
+                        save(self.network.state_dict(), "best_model.pt")
 
                         self.lower_loss = loss.item()
                         pg.postfix[0] = self.lower_loss
 
                 pg.update()
 
-        self.br_network.load_state_dict(load("best_br_network.pt"))
-        self.t_network.load_state_dict(load("best_t_network.pt"))
-        self.s_network.load_state_dict(load("best_s_network.pt"))
+        self.network.load_state_dict(load("best_model.pt"))
 
-    def loss(self, t: Tensor, s: Tensor, br: Tensor) -> Tensor:
+    def loss(self, inputs: Tensor, evaluate: bool = False) -> Tensor | dict:
         r"""
         Computing the loss function.
-        - (tensor) `inputs` the inputs.
+        - (tensor) `inputs` the inputs form which the loss is estimated.
+        - (bool) `evaluate` returning the fields instead of the loss.
         """
         rC = 3485
+
+        # Retrieving the predictions
+        predictions = self.network(inputs)
+        t = predictions[...,0:1]
+        s = predictions[...,1:2]
+        br = 1e6 * predictions[...,2:3]
 
         # Retrieving observations
         br_obs = self.tensors["br"]
@@ -260,5 +266,23 @@ class pygeopinn:
         dbrdt = -(br * divh_uh + gradθ_br * uθ + gradφ_br * uφ)
 
         loss = (dbrdt_obs - dbrdt).pow(2).mean() / dbrdt_obs.pow(2).mean()
+        loss += (br_obs - br).pow(2).mean() / br_obs.pow(2).mean()
+
+        if evaluate:
+            self.predictions = {
+                "br": br.detach().numpy().reshape(self.shape), "t": t.detach().numpy().reshape(self.shape),
+                "s": s.detach().numpy().reshape(self.shape), "uθ": uθ.detach().numpy().reshape(self.shape),
+                "uφ": uφ.detach().numpy().reshape(self.shape), "dbrdt": dbrdt.detach().numpy().reshape(self.shape)
+            }
+            return self.predictions
 
         return loss
+    
+    def evaluate(self) -> dict:
+        """
+        Evaluating the networks predictions.
+        """
+        self.network.load_state_dict(load("best_model.pt"))
+        self.network.eval()
+
+        return self.loss(self.inputs, True)
