@@ -8,15 +8,14 @@
 __version__ = 0
 
 # Imports
-from torch import nn, autograd, optim, amp
-from torch import tensor, Tensor, no_grad, ones_like, concat, autocast, bfloat16, \
-    save, load, float32, sin, cos, manual_seed, use_deterministic_algorithms
-from numpy import ndarray, min, max, meshgrid
+import torch
+import numpy
+import scipy
 from numpy import pi as π
 from tqdm import tqdm
 
-manual_seed(0)
-use_deterministic_algorithms(True)
+torch.manual_seed(0)
+torch.use_deterministic_algorithms(True)
 
 class pygeopinn:
     r"""
@@ -25,18 +24,18 @@ class pygeopinn:
     Along with the azimuthal and polar components of the flow, the magnetic field
     is co-estimated.
     """    
-    class __network__(nn.Module):
+    class _network(torch.nn.Module):
         """
         Nested class for creating a single neural network.
         """
-        class Sine(nn.Module):
+        class Sine(torch.nn.Module):
             """
             Creating the Sine activation function
             """
             def __init__(self):
                 super().__init__()
             def forward(self, x):
-                return sin(x)
+                return torch.sin(x)
             
         def __init__(self, nb_layers: int, nb_neurons: int) -> None:
             """
@@ -50,33 +49,33 @@ class pygeopinn:
             layers = []
 
             # Creating the first layer
-            layers.append(nn.Linear(2, nb_neurons, dtype=float32))
+            layers.append(torch.nn.Linear(2, nb_neurons, dtype=torch.float32))
             layers.append(self.Sine())
 
             # Creating the hidden layers
             for _ in range(nb_layers):
-                layers.append(nn.Linear(nb_neurons, nb_neurons, dtype=float32))
+                layers.append(torch.nn.Linear(nb_neurons, nb_neurons, dtype=torch.float32))
                 layers.append(self.Sine())
 
             # Creating the last layer
-            layers.append(nn.Linear(nb_neurons, 3, dtype=float32))
+            layers.append(torch.nn.Linear(nb_neurons, 3, dtype=torch.float32))
 
             # Creating the network
-            self.net = nn.Sequential(*layers)
+            self.net = torch.nn.Sequential(*layers)
 
             # Initializing the weights
-            with no_grad():
+            with torch.no_grad():
                 for module in self.net.modules():
                     if module._get_name() == "Linear":
-                        nn.init.xavier_uniform_(module.weight)
+                        torch.nn.init.xavier_uniform_(module.weight)
 
-        def forward(self, input) -> Tensor:
+        def forward(self, input) -> torch.Tensor:
             """
             Forward method.
             - (tensor) `input` the input tensor.
             """
             return self.net(input)
-
+            
     def __init__(self, nb_layers: int = 5, nb_neurons: int = 32, verbose: bool = True) -> None:
         r"""
         Initializing the library, and the network.
@@ -84,7 +83,7 @@ class pygeopinn:
         - (int) `nb_neurons` the number of neurons (default: 32)
         - (bool) `verbose` enable the verbose mode (default: true)
         """
-        self.network = self.__network__(nb_layers, nb_neurons)
+        self.network = self._network(nb_layers, nb_neurons)
 
         self.nb_layers = nb_layers
         self.nb_neurons = nb_neurons
@@ -97,16 +96,16 @@ class pygeopinn:
         if self.verbose:
             print("The library was successfully initialized.")
 
-    def set_grid(self, thetas: ndarray, phis: ndarray) -> None:
+    def set_grid(self, thetas: numpy.ndarray, phis: numpy.ndarray) -> None:
         """
         Setting the grid.
         - (array) `thetas` the grid along the θ axis
         - (array) `phis` the grid along the φ axis
         """
-        if min(thetas) < 0 or max(thetas) > π:
+        if numpy.min(thetas) < 0 or numpy.max(thetas) > π:
             raise Exception("The grid along the θ-axis must be between 0 and π radians.")
         
-        if min(phis) < 0 or max(phis) > 2 * π:
+        if numpy.min(phis) < 0 or numpy.max(phis) > 2 * π:
             raise Exception("The grid along the φ-axis must be between 0 and 2π radians.")
         
         self.grid = {"thetas": thetas, "phis": phis}
@@ -114,7 +113,7 @@ class pygeopinn:
         if self.verbose:
             print("The grid was successfully set.")
 
-    def set_observation(self, name: str, observation: ndarray, overwrite: bool = True) -> None:
+    def set_observation(self, name: str, observation: numpy.ndarray, overwrite: bool = True) -> None:
         """
         Adding an observation.
         - (str) `name` the name of the observation.
@@ -124,7 +123,7 @@ class pygeopinn:
         if name in self.observations and not overwrite:
             raise Exception(f"The observation {name} already exists.")
         
-        if not isinstance(observation, (ndarray)):
+        if not isinstance(observation, (numpy.ndarray)):
             raise Exception("The observation must be an array.")
         
         if len(observation.shape) != 2:
@@ -135,15 +134,33 @@ class pygeopinn:
         if self.verbose:
             print(f"The observation {name} was successfully added.")
 
-    def _array_to_tensor(self, array: ndarray, requires_grad: bool = True) -> Tensor:
+    def set_loss(self, name: str, value: float, overwrite: bool = True) -> None:
+        """
+        Setting a loss function for the training.
+        - (str) `name` the name of the loss function.
+        - (float) `value` the weight factor associated.
+        - (bool) `overwrite` allow overwriting the weight value
+        """
+        if name in self.losses and not overwrite:
+            raise Exception(f"The loss {name} already exists.")
+        
+        if not isinstance(value, (int, float)):
+            raise Exception("The weight must be a real number.")
+        
+        self.losses.update({name: value})
+
+        if self.verbose:
+            print(f"The loss {name} was successfully added.")
+
+    def _array_to_tensor(self, array: numpy.ndarray, requires_grad: bool = True) -> torch.Tensor:
         """
         Converting a numpy array into a torch tensor.
         - (array) `array` the array to convert.
         - (bool) `requires_grad` flag for autograd to record, or not, operations.
         """
-        return tensor(array, requires_grad=requires_grad, dtype=float32)
+        return torch.tensor(array, requires_grad=requires_grad, dtype=torch.float32)
     
-    def _autograd(self, tensor: Tensor, inputs: list, retain_graph: bool = True, create_graph: bool = True) -> tuple:
+    def _autograd(self, tensor: torch.Tensor, inputs: list, retain_graph: bool = True, create_graph: bool = True) -> tuple:
         """
         Computing the gradients of the tensor wrt the inputs.
         - (tensor) `tensor` the tensor from which the gradients are computed.
@@ -151,7 +168,7 @@ class pygeopinn:
         - (bool) `retain_graph` keeping in memory the gradient graph.
         - (bool) `create_graph` creating the graph to compute higher-order derivatives.
         """
-        return autograd.grad(tensor, inputs, ones_like(tensor), retain_graph, create_graph)
+        return torch.autograd.grad(tensor, inputs, torch.ones_like(tensor), retain_graph, create_graph)
     
     def initialize(self) -> None:
         """
@@ -162,7 +179,7 @@ class pygeopinn:
                 name: self._array_to_tensor(self.observations[name].reshape(-1, 1))
             })
 
-        thetas_grid, phis_grid = meshgrid(self.grid["thetas"], self.grid["phis"], indexing="ij")
+        thetas_grid, phis_grid = numpy.meshgrid(self.grid["thetas"], self.grid["phis"], indexing="ij")
 
         # Useful for reshaping torch's squeezed fields later
         self.shape = thetas_grid.shape
@@ -172,8 +189,8 @@ class pygeopinn:
             "phis": self._array_to_tensor(phis_grid.reshape(-1, 1))
         })
 
-        self.inputs = concat([self.tensors["thetas"], self.tensors["phis"]], dim=1)
-
+        self.inputs = torch.concat([self.tensors["thetas"], self.tensors["phis"]], dim=1)
+        
         if self.verbose:
             print("Everything is ready for the training.")
 
@@ -191,8 +208,8 @@ class pygeopinn:
 
         # TODO: Check if everything is ready before starting
 
-        optimizer = optim.AdamW(self.network.parameters())
-        scaler = amp.GradScaler("cpu")
+        optimizer = torch.optim.AdamW(self.network.parameters(), lr=1e-2, weight_decay=1e-8)
+        scaler = torch.amp.GradScaler("cpu")
 
         tqdm_format = "{percentage:3.2f}% ({remaining} remaining) | Loss = {postfix[0]:.3E}"
         
@@ -201,29 +218,29 @@ class pygeopinn:
                 optimizer.zero_grad(set_to_none=True)
 
                 # Mixed precision to speed up calculations
-                with autocast(device_type="cpu", dtype=bfloat16, enabled=True):
+                with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=True):
                     loss = self.loss(self.inputs)
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
 
-                nn.utils.clip_grad_norm_(self.network.parameters(), 1)
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1)
 
                 scaler.step(optimizer)
                 scaler.update()
 
-                with no_grad():
+                with torch.no_grad():
                     if loss.item() < self.lower_loss:
-                        save(self.network.state_dict(), "best_model.pt")
+                        torch.save(self.network.state_dict(), "best_model.pt")
 
                         self.lower_loss = loss.item()
                         pg.postfix[0] = self.lower_loss
 
                 pg.update()
 
-        self.network.load_state_dict(load("best_model.pt"))
+        self.network.load_state_dict(torch.load("best_model.pt"))
 
-    def loss(self, inputs: Tensor, evaluate: bool = False) -> Tensor | dict:
+    def loss(self, inputs: torch.Tensor, evaluate: bool = False) -> torch.Tensor | dict:
         r"""
         Computing the loss function.
         - (tensor) `inputs` the inputs form which the loss is estimated.
@@ -243,8 +260,8 @@ class pygeopinn:
 
         θ = self.tensors["thetas"]
         φ = self.tensors["phis"]
-        sinθ = sin(θ).clamp(1e-1, 1)
-        cosθ = cos(θ)
+        sinθ = torch.sin(θ).clamp(1e-1, 1)
+        cosθ = torch.cos(θ)
 
         dtdθ, dtdφ = self._autograd(t, [θ, φ])
         dsdθ, dsdφ = self._autograd(s, [θ, φ])
@@ -254,8 +271,8 @@ class pygeopinn:
         uφ = -(1 / sinθ) * dtdθ + dsdφ
 
         # Computing derivatives
-        duθdθ, duθdφ = self._autograd(uθ, [θ,φ])
-        duφdθ, duφdφ = self._autograd(uφ, [θ,φ])
+        duθdθ, _ = self._autograd(uθ, [θ,φ])
+        _, duφdφ = self._autograd(uφ, [θ,φ])
         dbrdθ, dbrdφ = self._autograd(br, [θ,φ])
 
         # Computing divergence and gradient operators
@@ -264,9 +281,24 @@ class pygeopinn:
         gradφ_br = (1 / (rC * sinθ)) * dbrdφ
 
         dbrdt = -(br * divh_uh + gradθ_br * uθ + gradφ_br * uφ)
+        
+        # Starting the calculation of the losses
+        total_loss = torch.tensor([0], dtype=torch.float32)
 
-        loss = (dbrdt_obs - dbrdt).pow(2).mean() / dbrdt_obs.pow(2).mean()
-        loss += (br_obs - br).pow(2).mean() / br_obs.pow(2).mean()
+        # Computing L = (dbrdt_obs - dbrdt_pred)² / dbrdt_obs²
+        if "dbrdt" in self.losses:
+            total_loss += self.losses["dbrdt"] * (dbrdt_obs - dbrdt).pow(2).mean() / dbrdt_obs.pow(2).mean()
+
+        # Computing L = (br_obs - br_pred)² / br_obs²
+        if "br" in self.losses:
+            total_loss += self.losses["br"] * (br_obs - br).pow(2).mean() / br_obs.pow(2).mean()
+
+        # Computing L = ∫ ∇h·(uh cos²θ) dΩ
+        if "geostrophy" in self.losses:
+            dθ = numpy.gradient(self.grid["thetas"])[0]
+            dφ = numpy.gradient(self.grid["phis"])[0]
+            dΩ = sinθ * dθ * dφ
+            total_loss += self.losses["geostrophy"] * sum((cosθ * divh_uh - 2 * sinθ * uθ / rC).pow(2) * dΩ)
 
         if evaluate:
             self.predictions = {
@@ -276,13 +308,13 @@ class pygeopinn:
             }
             return self.predictions
 
-        return loss
+        return total_loss
     
     def evaluate(self) -> dict:
         """
         Evaluating the networks predictions.
         """
-        self.network.load_state_dict(load("best_model.pt"))
+        self.network.load_state_dict(torch.load("best_model.pt"))
         self.network.eval()
 
         return self.loss(self.inputs, True)
