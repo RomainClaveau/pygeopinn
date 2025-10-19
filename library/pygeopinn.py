@@ -75,6 +75,146 @@ class pygeopinn:
             - (tensor) `input` the input tensor.
             """
             return self.net(input)
+        
+    class _spectral:
+        """
+        Module for computing the spherical harmonics and forward / backward transforms.
+        """
+        def __init__(self, thetas: numpy.ndarray, phis: numpy.ndarray, lmax: int = 30) -> None:
+            """
+            Initializing the spectral module
+            - (array) `thetas` the grid along the θ-axis.
+            - (array) `phis` the grid along the φ-axis.
+            - (lmax) `lmax` the truncation degree.
+            """
+            if numpy.min(thetas) < 0 or numpy.max(thetas) > π:
+                raise Exception("The grid along the θ-axis must be between 0 and π radians.")
+            
+            if numpy.min(phis) < 0 or numpy.max(phis) > 2 * π:
+                raise Exception("The grid along the φ-axis must be between 0 and 2π radians.")
+            
+            if lmax < 1 or lmax > 100:
+                raise Exception("The truncation degree must be between 1 and 100.")
+            
+            self.thetas = torch.tensor(thetas, dtype=torch.float64)
+            self.phis = torch.tensor(phis, dtype=torch.float64)
+            self.lmax = lmax
+
+            self._ycos, self._ysin = self._spherical_harmonics(self.lmax)
+
+        def _spherical_harmonics(self, lmax: int = 30) -> tuple:
+            """
+            Computing the spherical harmonics up to the truncation degree lmax
+            on the specified grid.
+            - (int) `lmax` the truncation degree
+            """
+            if lmax < 1 or lmax > 100:
+                raise Exception("The truncation degree must be between 1 and 100.")
+            
+            if lmax > self.lmax:
+                self.lmax = lmax
+
+            l = torch.arange(0, self.lmax + 1, 1)
+            L, M = torch.meshgrid(l, l, indexing="ij")
+
+            θ, φ = torch.meshgrid(self.thetas, self.phis, indexing="ij")
+            cosθ = torch.cos(θ)
+
+            def δ(x):
+                return (x == 0).to(torch.float32)
+            
+            def Γ(x):
+                return torch.tensor(scipy.special.factorial(x), dtype=torch.float64)
+            
+            schmidt = torch.sqrt(torch.abs((2 - δ(M)) * Γ(L - M) / Γ(L + M)))
+
+            p, *_ = scipy.special.assoc_legendre_p_all(lmax, lmax, cosθ)
+            p = torch.tensor(p[:,:(lmax+1),...], dtype=torch.float64)
+            p = torch.einsum("ijkl,ij->ijkl", p, schmidt)
+
+            mφ = torch.einsum("ij,kl->ijkl", M, φ)
+            cosmφ = torch.cos(mφ)
+            sinmφ = torch.sin(mφ)
+
+            print(f"Computed for lmax = {lmax}")
+
+            return cosmφ * p, sinmφ * p
+        
+        def ycos(self, lmax: int) -> torch.Tensor:
+            """
+            Retrieving the cosine part of the spherical harmonics.
+            (int) `lmax` the required truncation degree.
+            """
+            if lmax < 1 or lmax > 100:
+                raise Exception("The truncation degree must be between 1 and 100.")
+            
+            if lmax > self.lmax:
+                self._ycos, self._ysin = self._spherical_harmonics(lmax)
+
+            return self._ycos[:lmax+1,:lmax+1,...]
+        
+        def ysin(self, lmax: int) -> torch.Tensor:
+            """
+            Retrieving the sine part of the spherical harmonics.
+            (int) `lmax` the required truncation degree.
+            """
+            if lmax < 1 or lmax > 100:
+                raise Exception("The truncation degree must be between 1 and 100.")
+            
+            if lmax > self.lmax:
+                self._ycos, self._ysin = self._spherical_harmonics(lmax)
+
+            return self._ysin[:lmax+1,:lmax+1,...]
+        
+        def forward(self, x: torch.Tensor, lmax: int) -> tuple:
+            """
+            Performing forward spectral transformation of a field.
+            - (tensor) `x` the field to process.
+            - (int) `lmax` the truncation degree.
+            """
+            if lmax < 1 or lmax > 100:
+                raise Exception("The truncation degree must be between 1 and 100.")
+            
+            ycos = self.ycos(lmax)
+            ysin = self.ysin(lmax)
+
+            l = torch.arange(0, lmax + 1, 1)
+            L, M = torch.meshgrid(l, l, indexing="ij")
+
+            θ, φ = torch.meshgrid(self.thetas, self.phis, indexing="ij")
+            sinθ = torch.sin(θ)
+            dθ = torch.gradient(self.thetas)[0].mean()
+            dφ = torch.gradient(self.phis)[0].mean()
+            dΩ = sinθ * dθ * dφ
+
+            weight = (2 * L + 1) / torch.sum(dΩ)
+
+            coeffs_cos = weight * torch.einsum("ijkl,kl->ij", ycos, x * dΩ)
+            coeffs_sin = weight * torch.einsum("ijkl,kl->ij", ysin, x * dΩ)
+
+            return coeffs_cos, coeffs_sin
+        
+        def backward(self, xcos: torch.Tensor, xsin: torch.Tensor, lmax: int) -> torch.Tensor:
+            """
+            Performing backward spectral transformation of a field.
+            - (tensor) `xcos` the cosine part of the spectral coefficients.  
+            - (tensor) `xsin` the sine part of the spectral coefficients.  
+            - (int) `lmax` the truncation degree.  
+            """
+            if lmax < 1 or lmax > 100:
+                raise Exception("The truncation degree must be between 1 and 100.")
+            
+            if lmax > xcos.shape[0] - 1:
+                raise Exception("Spectral coefficients have lower truncation degree than requested.")
+            
+            if len(xcos.shape) != 2 or len(xsin.shape) != 2:
+                raise Exception("Spectral coeffients must be 2 dimensional arrays.")
+            
+            ycos = self.ycos(lmax)
+            ysin = self.ysin(lmax)
+            
+            return torch.einsum("ijkl,ij->kl", ycos, xcos[:lmax+1,:lmax+1]) \
+                + torch.einsum("ijkl,ij->kl", ysin, xsin[:lmax+1,:lmax+1])
             
     def __init__(self, nb_layers: int = 5, nb_neurons: int = 32, verbose: bool = True) -> None:
         r"""
@@ -184,6 +324,9 @@ class pygeopinn:
         # Useful for reshaping torch's squeezed fields later
         self.shape = thetas_grid.shape
 
+        # Initializing the spectral module
+        self.spectral = self._spectral(self.grid["thetas"], self.grid["phis"], 13)
+
         self.tensors.update({
             "thetas": self._array_to_tensor(thetas_grid.reshape(-1, 1)),
             "phis": self._array_to_tensor(phis_grid.reshape(-1, 1))
@@ -288,6 +431,11 @@ class pygeopinn:
         # Computing L = (dbrdt_obs - dbrdt_pred)² / dbrdt_obs²
         if "dbrdt" in self.losses:
             total_loss += self.losses["dbrdt"] * (dbrdt_obs - dbrdt).pow(2).mean() / dbrdt_obs.pow(2).mean()
+
+        if "dbrdt_large_scale" in self.losses:
+            xcos, xsin = self.spectral.forward(dbrdt.reshape(self.shape), 13)
+            dbrdt_large_scale = self.spectral.backward(xcos, xsin, 13).reshape((-1, 1))
+            total_loss += self.losses["dbrdt_large_scale"] * (dbrdt_obs - dbrdt_large_scale).pow(2).mean() / dbrdt_obs.pow(2).mean()
 
         # Computing L = (br_obs - br_pred)² / br_obs²
         if "br" in self.losses:
