@@ -14,6 +14,9 @@ import scipy
 from numpy import pi as π
 from tqdm import tqdm
 
+rE = 6371.2
+rC = 3485.0
+
 torch.manual_seed(0)
 torch.use_deterministic_algorithms(True)
 
@@ -178,6 +181,9 @@ class pygeopinn:
             ycos = self.ycos(lmax)
             ysin = self.ysin(lmax)
 
+            if ycos.shape[-2:] != x.shape:
+                raise Exception("The provided tensor does not match with the expected spatial grid.")
+
             l = torch.arange(0, lmax + 1, 1)
             L, M = torch.meshgrid(l, l, indexing="ij")
 
@@ -189,8 +195,8 @@ class pygeopinn:
 
             weight = (2 * L + 1) / torch.sum(dΩ)
 
-            coeffs_cos = weight * torch.einsum("ijkl,kl->ij", ycos, x * dΩ)
-            coeffs_sin = weight * torch.einsum("ijkl,kl->ij", ysin, x * dΩ)
+            coeffs_cos = weight * torch.tensordot(ycos, x * dΩ, dims=2)
+            coeffs_sin = weight * torch.tensordot(ysin, x * dΩ, dims=2)
 
             return coeffs_cos, coeffs_sin
         
@@ -212,9 +218,35 @@ class pygeopinn:
             
             ycos = self.ycos(lmax)
             ysin = self.ysin(lmax)
+
+            return torch.tensordot(xcos[:lmax+1,:lmax+1], ycos, dims=2) + \
+                torch.tensordot(xsin[:lmax+1,:lmax+1], ysin, dims=2)
+        
+        def spectrum(self, xs: list, lmax: int, output: str) -> torch.Tensor:
+            """
+            Compute the spectrum associated with the field.
+            - (list) `xs` the tensors from which the spectrum is computed.
+            - (int) `lmax` the truncation degree.
+            - (str) `output` which spectrum must be computed.
+            """
+            if not isinstance(xs, list):
+                raise Exception("The tensor(s) must be given through a list.")
             
-            return torch.einsum("ijkl,ij->kl", ycos, xcos[:lmax+1,:lmax+1]) \
-                + torch.einsum("ijkl,ij->kl", ysin, xsin[:lmax+1,:lmax+1])
+            coefficients = []
+
+            for x in xs:
+                coefficients.append(self.forward(x, lmax))
+
+            l = torch.arange(0, lmax + 1, 1)
+            L, _ = torch.meshgrid(l, l, indexing="ij")
+
+            # Sb(l) = (l + 1) Σ_m gnm**2 + hnm**2
+            if output == "spectrum_br":
+                xcos, xsin = coefficients[0]
+                xcos /= (L + 1) * (rE / rC)**(L + 2)
+                xsin /= (L + 1) * (rE / rC)**(L + 2)
+                return (l + 1) * (xcos.pow(2) + xsin.pow(2)).sum(dim=1)
+                
             
     def __init__(self, nb_layers: int = 5, nb_neurons: int = 32, verbose: bool = True) -> None:
         r"""
@@ -389,8 +421,6 @@ class pygeopinn:
         - (tensor) `inputs` the inputs form which the loss is estimated.
         - (bool) `evaluate` returning the fields instead of the loss.
         """
-        rC = 3485
-
         # Retrieving the predictions
         predictions = self.network(inputs)
         t = predictions[...,0:1]
@@ -428,18 +458,29 @@ class pygeopinn:
         # Starting the calculation of the losses
         total_loss = torch.tensor([0], dtype=torch.float32)
 
+        self.spectral.spectrum([br.reshape(self.shape)], 13, "spectrum_br")
+
         # Computing L = (dbrdt_obs - dbrdt_pred)² / dbrdt_obs²
         if "dbrdt" in self.losses:
             total_loss += self.losses["dbrdt"] * (dbrdt_obs - dbrdt).pow(2).mean() / dbrdt_obs.pow(2).mean()
 
         if "dbrdt_large_scale" in self.losses:
             xcos, xsin = self.spectral.forward(dbrdt.reshape(self.shape), 13)
+            xcos_obs, xsin_obs = self.spectral.forward(dbrdt_obs.reshape(self.shape), 13)
             dbrdt_large_scale = self.spectral.backward(xcos, xsin, 13).reshape((-1, 1))
-            total_loss += self.losses["dbrdt_large_scale"] * (dbrdt_obs - dbrdt_large_scale).pow(2).mean() / dbrdt_obs.pow(2).mean()
+            dbrdt_large_scale_obs = self.spectral.backward(xcos_obs, xsin_obs, 13).reshape((-1, 1))
+            total_loss += self.losses["dbrdt_large_scale"] * (dbrdt_large_scale_obs - dbrdt_large_scale).pow(2).mean() / dbrdt_large_scale_obs.pow(2).mean()
 
         # Computing L = (br_obs - br_pred)² / br_obs²
         if "br" in self.losses:
             total_loss += self.losses["br"] * (br_obs - br).pow(2).mean() / br_obs.pow(2).mean()
+
+        if "br_large_scale" in self.losses:
+            xcos, xsin = self.spectral.forward(br.reshape(self.shape), 13)
+            xcos_obs, xsin_obs = self.spectral.forward(br_obs.reshape(self.shape), 13)
+            br_large_scale = self.spectral.backward(xcos, xsin, 13).reshape((-1, 1))
+            br_large_scale_obs = self.spectral.backward(xcos_obs, xsin_obs, 13).reshape((-1, 1))
+            total_loss += self.losses["br_large_scale"] * (br_large_scale_obs - br_large_scale).pow(2).mean() / br_large_scale_obs.pow(2).mean()
 
         # Computing L = ∫ ∇h·(uh cos²θ) dΩ
         if "geostrophy" in self.losses:
@@ -447,6 +488,11 @@ class pygeopinn:
             dφ = numpy.gradient(self.grid["phis"])[0]
             dΩ = sinθ * dθ * dφ
             total_loss += self.losses["geostrophy"] * sum((cosθ * divh_uh - 2 * sinθ * uθ / rC).pow(2) * dΩ)
+
+        if "spectrum_br" in self.losses:
+            Sb_obs = self.spectral.spectrum([br_obs.reshape(self.shape)], 30, "spectrum_br")
+            Sb_pred = self.spectral.spectrum([br.reshape(self.shape)], 30, "spectrum_br")
+            total_loss += self.losses["spectrum_br"] * ((Sb_obs - Sb_pred) / Sb_obs).pow(2).mean()
 
         if evaluate:
             self.predictions = {
