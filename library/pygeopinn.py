@@ -52,7 +52,7 @@ class pygeopinn:
             layers = []
 
             # Creating the first layer
-            layers.append(torch.nn.Linear(2, nb_neurons, dtype=torch.float32))
+            layers.append(torch.nn.Linear(3, nb_neurons, dtype=torch.float32))
             layers.append(self.Sine())
 
             # Creating the hidden layers
@@ -129,7 +129,7 @@ class pygeopinn:
             def Γ(x):
                 return torch.tensor(scipy.special.factorial(x), dtype=torch.float64)
             
-            schmidt = torch.sqrt(torch.abs((2 - δ(M)) * Γ(L - M) / Γ(L + M)))
+            schmidt = (-1)**M * torch.sqrt(torch.abs((2 - δ(M)) * Γ(L - M) / Γ(L + M)))
 
             p, *_ = scipy.special.assoc_legendre_p_all(lmax, lmax, cosθ)
             p = torch.tensor(p[:,:(lmax+1),...], dtype=torch.float64)
@@ -181,7 +181,7 @@ class pygeopinn:
             ycos = self.ycos(lmax)
             ysin = self.ysin(lmax)
 
-            if ycos.shape[-2:] != x.shape:
+            if ycos.shape[-2:] != x.shape[-2:]:
                 raise Exception("The provided tensor does not match with the expected spatial grid.")
 
             l = torch.arange(0, lmax + 1, 1)
@@ -195,8 +195,12 @@ class pygeopinn:
 
             weight = (2 * L + 1) / torch.sum(dΩ)
 
-            coeffs_cos = weight * torch.tensordot(ycos, x * dΩ, dims=2)
-            coeffs_sin = weight * torch.tensordot(ysin, x * dΩ, dims=2)
+            if len(x.shape) == 3:
+                coeffs_cos = weight * torch.einsum("ijkl,mkl->mij", ycos, x * dΩ)
+                coeffs_sin = weight * torch.einsum("ijkl,mkl->mij", ysin, x * dΩ)
+            else:
+                coeffs_cos = weight * torch.einsum("ijkl,kl->ij", ycos, x * dΩ)
+                coeffs_sin = weight * torch.einsum("ijkl,kl->ij", ysin, x * dΩ)
 
             return coeffs_cos, coeffs_sin
         
@@ -210,17 +214,17 @@ class pygeopinn:
             if lmax < 1 or lmax > 100:
                 raise Exception("The truncation degree must be between 1 and 100.")
             
-            if lmax > xcos.shape[0] - 1:
+            if lmax > xcos.shape[-1] - 1:
                 raise Exception("Spectral coefficients have lower truncation degree than requested.")
             
-            if len(xcos.shape) != 2 or len(xsin.shape) != 2:
-                raise Exception("Spectral coeffients must be 2 dimensional arrays.")
+            if len(xcos.shape) < 2 or len(xsin.shape) < 2:
+                raise Exception("Spectral coeffients must be at least 2 dimensional arrays.")
             
             ycos = self.ycos(lmax)
             ysin = self.ysin(lmax)
 
-            return torch.tensordot(xcos[:lmax+1,:lmax+1], ycos, dims=2) + \
-                torch.tensordot(xsin[:lmax+1,:lmax+1], ysin, dims=2)
+            return torch.tensordot(xcos[...,:lmax+1,:lmax+1], ycos, dims=2) + \
+                torch.tensordot(xsin[...,:lmax+1,:lmax+1], ysin, dims=2)
         
         def spectrum(self, xs: list, lmax: int, output: str) -> torch.Tensor:
             """
@@ -246,6 +250,12 @@ class pygeopinn:
                 xcos /= (L + 1) * (rE / rC)**(L + 2)
                 xsin /= (L + 1) * (rE / rC)**(L + 2)
                 return (l + 1) * (xcos.pow(2) + xsin.pow(2)).sum(dim=1)
+            
+            if output == "spectrum_dbrdt":
+                xcos, xsin = coefficients[0]
+                xcos /= (L + 1) * (rE / rC)**(L + 2)
+                xsin /= (L + 1) * (rE / rC)**(L + 2)
+                return (l + 1) * (xcos.pow(2) + xsin.pow(2)).sum(dim=1)
                 
             
     def __init__(self, nb_layers: int = 5, nb_neurons: int = 32, verbose: bool = True) -> None:
@@ -264,23 +274,39 @@ class pygeopinn:
         self.observations = {}
         self.tensors = {}
         self.losses = {}
+        self.history = {}
 
         if self.verbose:
             print("The library was successfully initialized.")
 
-    def set_grid(self, thetas: numpy.ndarray, phis: numpy.ndarray) -> None:
+    def set_grid(self, times: numpy.ndarray, thetas: numpy.ndarray, phis: numpy.ndarray, rescale_times: bool = True) -> None:
         """
         Setting the grid.
+        - (array) `times` the grid along the time axis
         - (array) `thetas` the grid along the θ axis
         - (array) `phis` the grid along the φ axis
+        - (bool) `rescale_times` flag for rescaling the time input
         """
+
+        # IMPORTANT: Only the time component is rescaled as the spatial 
+        # grid is between 0 and 2π.
+
         if numpy.min(thetas) < 0 or numpy.max(thetas) > π:
             raise Exception("The grid along the θ-axis must be between 0 and π radians.")
         
         if numpy.min(phis) < 0 or numpy.max(phis) > 2 * π:
             raise Exception("The grid along the φ-axis must be between 0 and 2π radians.")
         
-        self.grid = {"thetas": thetas, "phis": phis}
+        self.rescaled_times = False
+
+        t = times.copy()
+
+        if rescale_times:
+            self.scale_times = 1 / t.max()
+            t *= self.scale_times
+            self.rescaled_times = True
+        
+        self.grid = {"times": t, "thetas": thetas.copy(), "phis": phis.copy()}
 
         if self.verbose:
             print("The grid was successfully set.")
@@ -298,10 +324,10 @@ class pygeopinn:
         if not isinstance(observation, (numpy.ndarray)):
             raise Exception("The observation must be an array.")
         
-        if len(observation.shape) != 2:
-            raise Exception("The observation must have 2 dimensions.")
+        if len(observation.shape) < 2:
+            raise Exception("The observation must have at least 2 dimensions.")
         
-        self.observations.update({name: observation})
+        self.observations.update({name: observation.copy()})
 
         if self.verbose:
             print(f"The observation {name} was successfully added.")
@@ -320,6 +346,7 @@ class pygeopinn:
             raise Exception("The weight must be a real number.")
         
         self.losses.update({name: value})
+        self.history.update({name: []})
 
         if self.verbose:
             print(f"The loss {name} was successfully added.")
@@ -339,6 +366,7 @@ class pygeopinn:
         - (list) `inputs` the list of inputs.
         - (bool) `retain_graph` keeping in memory the gradient graph.
         - (bool) `create_graph` creating the graph to compute higher-order derivatives.
+        - (list) `scales` the scale to be applied to retrieve the unscaled quantity
         """
         return torch.autograd.grad(tensor, inputs, torch.ones_like(tensor), retain_graph, create_graph)
     
@@ -351,8 +379,8 @@ class pygeopinn:
                 name: self._array_to_tensor(self.observations[name].reshape(-1, 1))
             })
 
-        thetas_grid, phis_grid = numpy.meshgrid(self.grid["thetas"], self.grid["phis"], indexing="ij")
-
+        times_grid, thetas_grid, phis_grid = numpy.meshgrid(self.grid["times"], self.grid["thetas"], self.grid["phis"], indexing="ij")
+        
         # Useful for reshaping torch's squeezed fields later
         self.shape = thetas_grid.shape
 
@@ -360,11 +388,14 @@ class pygeopinn:
         self.spectral = self._spectral(self.grid["thetas"], self.grid["phis"], 13)
 
         self.tensors.update({
+            "times": self._array_to_tensor(times_grid.reshape(-1, 1)),
             "thetas": self._array_to_tensor(thetas_grid.reshape(-1, 1)),
             "phis": self._array_to_tensor(phis_grid.reshape(-1, 1))
         })
 
-        self.inputs = torch.concat([self.tensors["thetas"], self.tensors["phis"]], dim=1)
+        self.inputs = torch.concat([
+            self.tensors["times"], self.tensors["thetas"], self.tensors["phis"]
+        ], dim=1)
         
         if self.verbose:
             print("Everything is ready for the training.")
@@ -386,9 +417,9 @@ class pygeopinn:
         optimizer = torch.optim.AdamW(self.network.parameters(), lr=1e-2, weight_decay=1e-8)
         scaler = torch.amp.GradScaler("cpu")
 
-        tqdm_format = "{percentage:3.2f}% ({remaining} remaining) | Loss = {postfix[0]:.3E}"
+        self.tqdm_format = "{percentage:3.2f}% ({remaining} remaining) | Loss = {postfix[0]:.3E}"
         
-        with tqdm(total=nb_epochs, bar_format=tqdm_format, postfix=[self.lower_loss]) as pg:
+        with tqdm(total=nb_epochs, bar_format=self.tqdm_format, postfix=[self.lower_loss]) as pg:
             for epoch in range(nb_epochs):
                 optimizer.zero_grad(set_to_none=True)
 
@@ -415,6 +446,39 @@ class pygeopinn:
 
         self.network.load_state_dict(torch.load("best_model.pt"))
 
+    def fine_tune(self, nb_epochs: int = 1000):
+        """
+        Fine-tuning the network with L-BFGS algorithm.
+        - (int) `nb_epochs` the number of epochs.
+        """
+        self.network.train()
+
+        self.network.load_state_dict(torch.load("best_model.pt"))
+
+        optimizer = torch.optim.LBFGS(self.network.parameters(), lr=1)
+
+        def closure():
+            optimizer.zero_grad(True)
+            loss = self.loss(self.inputs)
+            loss.backward()
+            return loss
+        
+        with tqdm(total=nb_epochs, bar_format=self.tqdm_format, postfix=[self.lower_loss]) as pg:
+            for epoch in range(nb_epochs):
+                loss = optimizer.step(closure)
+
+                with torch.no_grad():
+                    if loss.item() < self.lower_loss:
+                        torch.save(self.network.state_dict(), "best_model.pt")
+
+                        self.lower_loss = loss.item()
+                        pg.postfix[0] = self.lower_loss
+
+                pg.update()
+        
+        self.network.load_state_dict(torch.load("best_model.pt"))
+
+
     def loss(self, inputs: torch.Tensor, evaluate: bool = False) -> torch.Tensor | dict:
         r"""
         Computing the loss function.
@@ -425,14 +489,17 @@ class pygeopinn:
         predictions = self.network(inputs)
         t = predictions[...,0:1]
         s = predictions[...,1:2]
-        br = 1e6 * predictions[...,2:3]
+        br = 1e5 * predictions[...,2:3]
 
         # Retrieving observations
         br_obs = self.tensors["br"]
         dbrdt_obs = self.tensors["dbrdt"]
 
+        # The scaled inputs
+        τ = self.tensors["times"]
         θ = self.tensors["thetas"]
         φ = self.tensors["phis"]
+
         sinθ = torch.sin(θ).clamp(1e-1, 1)
         cosθ = torch.cos(θ)
 
@@ -441,12 +508,12 @@ class pygeopinn:
 
         # Retrieving uθ and uφ
         uθ = (1 / sinθ) * dtdφ + dsdθ
-        uφ = -(1 / sinθ) * dtdθ + dsdφ
+        uφ = -dtdθ + (1 / sinθ) * dsdφ
 
         # Computing derivatives
         duθdθ, _ = self._autograd(uθ, [θ,φ])
         _, duφdφ = self._autograd(uφ, [θ,φ])
-        dbrdθ, dbrdφ = self._autograd(br, [θ,φ])
+        dbrdτ, dbrdθ, dbrdφ = self._autograd(br, [τ,θ,φ])
 
         # Computing divergence and gradient operators
         divh_uh = (1 / (rC * sinθ)) * (duθdθ * sinθ + uθ * cosθ + duφdφ)
@@ -457,42 +524,75 @@ class pygeopinn:
         
         # Starting the calculation of the losses
         total_loss = torch.tensor([0], dtype=torch.float32)
-
-        self.spectral.spectrum([br.reshape(self.shape)], 13, "spectrum_br")
-
+        
         # Computing L = (dbrdt_obs - dbrdt_pred)² / dbrdt_obs²
         if "dbrdt" in self.losses:
-            total_loss += self.losses["dbrdt"] * (dbrdt_obs - dbrdt).pow(2).mean() / dbrdt_obs.pow(2).mean()
-
+            loss = self.losses["dbrdt"] * (dbrdt_obs - dbrdt).pow(2).mean() / dbrdt_obs.pow(2).mean()
+            self.history["dbrdt"].append(loss.detach().numpy())
+            total_loss += loss
+        
         if "dbrdt_large_scale" in self.losses:
             xcos, xsin = self.spectral.forward(dbrdt.reshape(self.shape), 13)
             xcos_obs, xsin_obs = self.spectral.forward(dbrdt_obs.reshape(self.shape), 13)
             dbrdt_large_scale = self.spectral.backward(xcos, xsin, 13).reshape((-1, 1))
             dbrdt_large_scale_obs = self.spectral.backward(xcos_obs, xsin_obs, 13).reshape((-1, 1))
-            total_loss += self.losses["dbrdt_large_scale"] * (dbrdt_large_scale_obs - dbrdt_large_scale).pow(2).mean() / dbrdt_large_scale_obs.pow(2).mean()
-
+            
+            loss = self.losses["dbrdt_large_scale"] * (dbrdt_large_scale_obs - dbrdt_large_scale).pow(2).mean() / dbrdt_large_scale_obs.pow(2).mean()
+            self.history["dbrdt_large_scale"].append(loss.detach().numpy())
+            total_loss += loss
+        
         # Computing L = (br_obs - br_pred)² / br_obs²
         if "br" in self.losses:
-            total_loss += self.losses["br"] * (br_obs - br).pow(2).mean() / br_obs.pow(2).mean()
+            loss = self.losses["br"] * (br_obs - br).pow(2).mean() / br_obs.pow(2).mean()
+            self.history["br"].append(loss.detach().numpy())
+            total_loss += loss
 
         if "br_large_scale" in self.losses:
             xcos, xsin = self.spectral.forward(br.reshape(self.shape), 13)
             xcos_obs, xsin_obs = self.spectral.forward(br_obs.reshape(self.shape), 13)
             br_large_scale = self.spectral.backward(xcos, xsin, 13).reshape((-1, 1))
             br_large_scale_obs = self.spectral.backward(xcos_obs, xsin_obs, 13).reshape((-1, 1))
-            total_loss += self.losses["br_large_scale"] * (br_large_scale_obs - br_large_scale).pow(2).mean() / br_large_scale_obs.pow(2).mean()
+            
+            loss = self.losses["br_large_scale"] * (br_large_scale_obs - br_large_scale).pow(2).mean() / br_large_scale_obs.pow(2).mean()
+            self.history["br_large_scale"].append(loss.detach().numpy())
+            total_loss += loss
 
         # Computing L = ∫ ∇h·(uh cos²θ) dΩ
         if "geostrophy" in self.losses:
             dθ = numpy.gradient(self.grid["thetas"])[0]
             dφ = numpy.gradient(self.grid["phis"])[0]
             dΩ = sinθ * dθ * dφ
-            total_loss += self.losses["geostrophy"] * sum((cosθ * divh_uh - 2 * sinθ * uθ / rC).pow(2) * dΩ)
+            
+            loss = self.losses["geostrophy"] * ((cosθ * divh_uh - sinθ * uθ / rC).pow(2) * dΩ).sum()
+            self.history["geostrophy"].append(loss.detach().numpy())
+            total_loss += loss
 
         if "spectrum_br" in self.losses:
             Sb_obs = self.spectral.spectrum([br_obs.reshape(self.shape)], 30, "spectrum_br")
             Sb_pred = self.spectral.spectrum([br.reshape(self.shape)], 30, "spectrum_br")
-            total_loss += self.losses["spectrum_br"] * ((Sb_obs - Sb_pred) / Sb_obs).pow(2).mean()
+            
+            loss = self.losses["spectrum_br"] * ((Sb_obs[1:] - Sb_pred[1:]) / Sb_obs[1:]).pow(2).mean()
+            self.history["spectrum_br"].append(loss.detach().numpy())
+            total_loss += loss
+
+        if "spectrum_dbrdt" in self.losses:
+            Sdb_obs = self.spectral.spectrum([dbrdt_obs.reshape(self.shape)], 30, "spectrum_dbrdt")
+            Sdb_pred = self.spectral.spectrum([dbrdt.reshape(self.shape)], 30, "spectrum_dbrdt")
+            
+            loss = self.losses["spectrum_dbrdt"] * ((Sdb_obs[1:] - Sdb_pred[1:]) / Sdb_obs[1:]).pow(2).mean()
+            self.history["spectrum_dbrdt"].append(loss.detach().numpy())
+            total_loss += loss
+
+        if "ΔBr" in self.losses:
+            xcos, xsin = self.spectral.forward(dbrdτ.reshape(self.shape), 13)
+            dbrdτ_large_scale = (self.spectral.backward(xcos, xsin, 13) * self.scale_times).reshape((-1, 1))
+
+            xcos_obs, xsin_obs = self.spectral.forward(dbrdt.reshape(self.shape), 13)
+            dbrdt_large_scale_obs = self.spectral.backward(xcos_obs, xsin_obs, 13).reshape((-1, 1))
+
+            loss = self.losses["ΔBr"] * (dbrdτ_large_scale - dbrdt_large_scale_obs).pow(2).mean() / dbrdt_large_scale_obs.pow(2).mean()
+            self.history["ΔBr"].append(loss.detach().numpy())
+            total_loss += loss
 
         if evaluate:
             self.predictions = {
@@ -504,7 +604,7 @@ class pygeopinn:
 
         return total_loss
     
-    def evaluate(self) -> dict:
+    def evaluate(self) -> dict | torch.Tensor:
         """
         Evaluating the networks predictions.
         """
