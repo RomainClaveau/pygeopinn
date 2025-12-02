@@ -35,10 +35,11 @@ class pygeopinn:
             """
             Creating the Sine activation function
             """
-            def __init__(self):
+            def __init__(self, w0=1.0):
                 super().__init__()
+                self.w0 = w0
             def forward(self, x):
-                return torch.sin(x)
+                return torch.sin(self.w0 * x)
             
         def __init__(self, nb_layers: int, nb_neurons: int) -> None:
             """
@@ -53,12 +54,12 @@ class pygeopinn:
 
             # Creating the first layer
             layers.append(torch.nn.Linear(3, nb_neurons, dtype=torch.float32))
-            layers.append(self.Sine())
+            layers.append(self.Sine(30.0))
 
             # Creating the hidden layers
             for _ in range(nb_layers):
                 layers.append(torch.nn.Linear(nb_neurons, nb_neurons, dtype=torch.float32))
-                layers.append(self.Sine())
+                layers.append(self.Sine(1.0))
 
             # Creating the last layer
             layers.append(torch.nn.Linear(nb_neurons, 3, dtype=torch.float32))
@@ -66,11 +67,17 @@ class pygeopinn:
             # Creating the network
             self.net = torch.nn.Sequential(*layers)
 
+            n = 1
+
             # Initializing the weights
             with torch.no_grad():
-                for module in self.net.modules():
-                    if module._get_name() == "Linear":
-                        torch.nn.init.xavier_uniform_(module.weight)
+                for m in self.net:
+                    if isinstance(m, torch.nn.Linear):
+                        w0 = 30.0 if n == 1 else 1.0
+                        bound = numpy.sqrt(6 / m.in_features) / w0
+                        torch.nn.init.uniform_(m.weight, -bound, bound)
+                        torch.nn.init.zeros_(m.bias)
+                        n += 1
 
         def forward(self, input) -> torch.Tensor:
             """
@@ -193,7 +200,7 @@ class pygeopinn:
             dφ = torch.gradient(self.phis)[0].mean()
             dΩ = sinθ * dθ * dφ
 
-            weight = (2 * L + 1) / torch.sum(dΩ)
+            weight = (2 * L + 1) / (4 * torch.pi)
 
             if len(x.shape) == 3:
                 coeffs_cos = weight * torch.einsum("ijkl,mkl->mij", ycos, x * dΩ)
@@ -226,12 +233,13 @@ class pygeopinn:
             return torch.tensordot(xcos[...,:lmax+1,:lmax+1], ycos, dims=2) + \
                 torch.tensordot(xsin[...,:lmax+1,:lmax+1], ysin, dims=2)
         
-        def spectrum(self, xs: list, lmax: int, output: str) -> torch.Tensor:
+        def spectrum(self, xs: list, lmax: int, output: str) -> None | torch.Tensor:
             """
             Compute the spectrum associated with the field.
             - (list) `xs` the tensors from which the spectrum is computed.
             - (int) `lmax` the truncation degree.
-            - (str) `output` which spectrum must be computed.
+            - (str) `output` which spectrum must be computed (`spectrum_br`,
+                `spectrum_dbrdt`)
             """
             if not isinstance(xs, list):
                 raise Exception("The tensor(s) must be given through a list.")
@@ -244,19 +252,33 @@ class pygeopinn:
             l = torch.arange(0, lmax + 1, 1)
             L, _ = torch.meshgrid(l, l, indexing="ij")
 
-            # Sb(l) = (l + 1) Σ_m gnm**2 + hnm**2
-            if output == "spectrum_br":
+            # Spectral
+            if output in ["spectrum_dbrdt", "spectrum_br"]:
                 xcos, xsin = coefficients[0]
                 xcos /= (L + 1) * (rE / rC)**(L + 2)
                 xsin /= (L + 1) * (rE / rC)**(L + 2)
-                return (l + 1) * (xcos.pow(2) + xsin.pow(2)).sum(dim=1)
+                return (l + 1) * (xcos.pow(2) + xsin.pow(2)).sum(dim=2)
+
+            if output == "spectrum_u":
+                t_cos, t_sin = coefficients[0]
+                s_cos, s_sin = coefficients[1]
+                return (l * (l + 1) / (2 * l + 1)) * (t_cos.pow(2) + t_sin.pow(2) + \
+                    s_cos.pow(2) + s_sin.pow(2)).sum(dim=2)
             
-            if output == "spectrum_dbrdt":
+            # Physical
+            if output in ["squared_norm_br", "squared_norm_dbrdt"]:
                 xcos, xsin = coefficients[0]
                 xcos /= (L + 1) * (rE / rC)**(L + 2)
                 xsin /= (L + 1) * (rE / rC)**(L + 2)
-                return (l + 1) * (xcos.pow(2) + xsin.pow(2)).sum(dim=1)
-                
+                S = (l + 1) * (xcos.pow(2) + xsin.pow(2)).sum(dim=2)
+                return (((l + 1) / (2 * l + 1)) * (rE / rC)**(2 * l + 4) * S).sum(dim=1)
+            
+            if output == "squared_norm_u":
+                t_cos, t_sin = coefficients[0]
+                s_cos, s_sin = coefficients[1]
+                S = (l * (l + 1) / (2 * l + 1)) * (t_cos.pow(2) + t_sin.pow(2) + \
+                    s_cos.pow(2) + s_sin.pow(2)).sum(dim=2)
+                return S.sum(dim=1)
             
     def __init__(self, nb_layers: int = 5, nb_neurons: int = 32, verbose: bool = True) -> None:
         r"""
@@ -275,6 +297,11 @@ class pygeopinn:
         self.tensors = {}
         self.losses = {}
         self.history = {}
+        self.options = {}
+
+        # Temporary
+        self.P_inv_zz = self._array_to_tensor(numpy.loadtxt("misc/P_inv_10deg.mat"))
+        self.z_mean = self._array_to_tensor(numpy.loadtxt("misc/z_10deg.vec"))
 
         if self.verbose:
             print("The library was successfully initialized.")
@@ -291,22 +318,33 @@ class pygeopinn:
         # IMPORTANT: Only the time component is rescaled as the spatial 
         # grid is between 0 and 2π.
 
+        self.θ_unscaled = thetas
+        self.φ_unscaled = phis
+
+        self.dt = numpy.diff(times).mean()
+        self.dθ = numpy.diff(thetas).mean()
+        self.dφ = numpy.diff(phis).mean()
+
         if numpy.min(thetas) < 0 or numpy.max(thetas) > π:
             raise Exception("The grid along the θ-axis must be between 0 and π radians.")
         
         if numpy.min(phis) < 0 or numpy.max(phis) > 2 * π:
             raise Exception("The grid along the φ-axis must be between 0 and 2π radians.")
         
-        self.rescaled_times = False
+        # Rescaling the inputs
+        self.tmin, self.tmax = times.min(), times.max()
+        self.θmin, self.θmax = thetas.min(), thetas.max()
+        self.φmin, self.φmax = phis.min(), phis.max()
 
-        t = times.copy()
+        # Rescale into [-1;+1]
+        def rescale(x, xmin, xmax):
+            return 2.0 * (x - xmin) / (xmax - xmin) - 1.0
 
-        if rescale_times:
-            self.scale_times = 1 / t.max()
-            t *= self.scale_times
-            self.rescaled_times = True
+        t_rescaled = rescale(times, times.min(), times.max())
+        θ_rescaled = rescale(thetas, thetas.min(), thetas.max())
+        φ_rescaled = rescale(phis, phis.min(), phis.max())
         
-        self.grid = {"times": t, "thetas": thetas.copy(), "phis": phis.copy()}
+        self.grid = {"times": t_rescaled, "thetas": θ_rescaled, "phis": φ_rescaled}
 
         if self.verbose:
             print("The grid was successfully set.")
@@ -337,7 +375,7 @@ class pygeopinn:
         Setting a loss function for the training.
         - (str) `name` the name of the loss function.
         - (float) `value` the weight factor associated.
-        - (bool) `overwrite` allow overwriting the weight value
+        - (bool) `overwrite` allows overwriting the weight value
         """
         if name in self.losses and not overwrite:
             raise Exception(f"The loss {name} already exists.")
@@ -350,6 +388,24 @@ class pygeopinn:
 
         if self.verbose:
             print(f"The loss {name} was successfully added.")
+
+    def set_option(self, name: str, value: bool, overwrite: bool = True):
+        """
+        Setting a option for the computation of the loss functions.
+        - (str) `name` the name of the option (`use_potential_br`, `use_dissipation`).
+        - (bool) `value` boolean flag.
+        - (bool) `overwrite` allows overwriting the flag value.
+        """
+        if name in self.options and not overwrite:
+            raise Exception(f"The loss {name} already exists.")
+        
+        if not isinstance(value, (bool)):
+            raise Exception("The flag must be a boolean.")
+        
+        self.options.update({name: value})
+
+        if self.verbose:
+            print(f"The option {name} was successfully added.")
 
     def _array_to_tensor(self, array: numpy.ndarray, requires_grad: bool = True) -> torch.Tensor:
         """
@@ -385,7 +441,8 @@ class pygeopinn:
         self.shape = thetas_grid.shape
 
         # Initializing the spectral module
-        self.spectral = self._spectral(self.grid["thetas"], self.grid["phis"], 13)
+
+        self.spectral = self._spectral(self.θ_unscaled, self.φ_unscaled, 13)
 
         self.tensors.update({
             "times": self._array_to_tensor(times_grid.reshape(-1, 1)),
@@ -400,7 +457,7 @@ class pygeopinn:
         if self.verbose:
             print("Everything is ready for the training.")
 
-    def train(self, nb_epochs: int = 10000, init: bool = True):
+    def warm(self, nb_epochs: int = 10000, lr: float = 1e-3, init: bool = True):
         """
         Training the networks.
         - (int) `nb_epochs` the number of epochs.
@@ -414,7 +471,7 @@ class pygeopinn:
 
         # TODO: Check if everything is ready before starting
 
-        optimizer = torch.optim.AdamW(self.network.parameters(), lr=1e-2, weight_decay=1e-8)
+        optimizer = torch.optim.AdamW(self.network.parameters(), lr=lr, weight_decay=1e-8)
         scaler = torch.amp.GradScaler("cpu")
 
         self.tqdm_format = "{percentage:3.2f}% ({remaining} remaining) | Loss = {postfix[0]:.3E}"
@@ -446,7 +503,7 @@ class pygeopinn:
 
         self.network.load_state_dict(torch.load("best_model.pt"))
 
-    def fine_tune(self, nb_epochs: int = 1000):
+    def fine_tune(self, nb_epochs: int = 1000, lr: float = 1e-1):
         """
         Fine-tuning the network with L-BFGS algorithm.
         - (int) `nb_epochs` the number of epochs.
@@ -455,7 +512,7 @@ class pygeopinn:
 
         self.network.load_state_dict(torch.load("best_model.pt"))
 
-        optimizer = torch.optim.LBFGS(self.network.parameters(), lr=1)
+        optimizer = torch.optim.LBFGS(self.network.parameters(), lr=lr, line_search_fn="strong_wolfe")
 
         def closure():
             optimizer.zero_grad(True)
@@ -487,12 +544,14 @@ class pygeopinn:
         """
         # Retrieving the predictions
         predictions = self.network(inputs)
-        t = predictions[...,0:1]
-        s = predictions[...,1:2]
+        t = 1e0 * predictions[...,0:1]
+        s = 1e0 * predictions[...,1:2]
         br = 1e5 * predictions[...,2:3]
 
         # Retrieving observations
         br_obs = self.tensors["br"]
+        dbrdθ_obs = self.tensors["dbrdθ"]
+        dbrdφ_obs = self.tensors["dbrdφ"]
         dbrdt_obs = self.tensors["dbrdt"]
 
         # The scaled inputs
@@ -500,98 +559,147 @@ class pygeopinn:
         θ = self.tensors["thetas"]
         φ = self.tensors["phis"]
 
-        sinθ = torch.sin(θ).clamp(1e-1, 1)
-        cosθ = torch.cos(θ)
+        # Unscaling the inputs
+        τ_unscaled = (1 + τ) * (self.tmax - self.tmin) / 2 + self.tmin
+        θ_unscaled = (1 + θ) * (self.θmax - self.θmin) / 2 + self.θmin
+        φ_unscaled = (1 + φ) * (self.φmax - self.φmin) / 2 + self.φmin
+
+        factor_τ = 2 / (self.tmax - self.tmin)
+        factor_θ = 2 / (self.θmax - self.θmin)
+        factor_φ = 2 / (self.φmax - self.φmin)
+
+        sinθ = torch.sin(θ_unscaled).clamp(1e-1, 1)
+        cosθ = torch.cos(θ_unscaled)
 
         dtdθ, dtdφ = self._autograd(t, [θ, φ])
         dsdθ, dsdφ = self._autograd(s, [θ, φ])
 
         # Retrieving uθ and uφ
-        uθ = (1 / sinθ) * dtdφ + dsdθ
-        uφ = -dtdθ + (1 / sinθ) * dsdφ
+        uθ = (1 / sinθ) * dtdφ * factor_φ + dsdθ * factor_θ
+        uφ = -dtdθ * factor_θ + (1 / sinθ) * dsdφ * factor_φ
 
         # Computing derivatives
-        duθdθ, _ = self._autograd(uθ, [θ,φ])
-        _, duφdφ = self._autograd(uφ, [θ,φ])
+        duθdθ, duθdφ = self._autograd(uθ, [θ,φ])
+        duφdθ, duφdφ = self._autograd(uφ, [θ,φ])
         dbrdτ, dbrdθ, dbrdφ = self._autograd(br, [τ,θ,φ])
 
         # Computing divergence and gradient operators
-        divh_uh = (1 / (rC * sinθ)) * (duθdθ * sinθ + uθ * cosθ + duφdφ)
-        gradθ_br = (1 / rC) * dbrdθ
-        gradφ_br = (1 / (rC * sinθ)) * dbrdφ
+        divh_uh = (1 / (rC * sinθ)) * (duθdθ * sinθ * factor_θ + uθ * cosθ + duφdφ * factor_φ)
+        gradθ_br = (1 / rC) * dbrdθ * factor_θ
+        gradφ_br = (1 / (rC * sinθ)) * dbrdφ * factor_φ
 
+        # d2brdθ2 = self._autograd(dbrdθ, [θ])[0]
+        # d2brdφ2 = self._autograd(dbrdφ, [φ])[0]
+
+        # Δbr = (1 / (rC**2 * sinθ)) * (cosθ * dbrdθ * factor_θ + sinθ * d2brdθ2 * factor_θ**2) + \
+        #     (1 / (rC * sinθ)**2) * d2brdφ2 * factor_φ**2
+        
         dbrdt = -(br * divh_uh + gradθ_br * uθ + gradφ_br * uφ)
         
         # Starting the calculation of the losses
         total_loss = torch.tensor([0], dtype=torch.float32)
-        
-        # Computing L = (dbrdt_obs - dbrdt_pred)² / dbrdt_obs²
-        if "dbrdt" in self.losses:
-            loss = self.losses["dbrdt"] * (dbrdt_obs - dbrdt).pow(2).mean() / dbrdt_obs.pow(2).mean()
-            self.history["dbrdt"].append(loss.detach().numpy())
-            total_loss += loss
+
+        dΩ = sinθ.reshape(self.shape) * self.dθ * self.dφ
+
+        lmax_large_scale = 13
         
         if "dbrdt_large_scale" in self.losses:
-            xcos, xsin = self.spectral.forward(dbrdt.reshape(self.shape), 13)
-            xcos_obs, xsin_obs = self.spectral.forward(dbrdt_obs.reshape(self.shape), 13)
-            dbrdt_large_scale = self.spectral.backward(xcos, xsin, 13).reshape((-1, 1))
-            dbrdt_large_scale_obs = self.spectral.backward(xcos_obs, xsin_obs, 13).reshape((-1, 1))
+            xcos, xsin = self.spectral.forward(dbrdt.reshape(self.shape), lmax_large_scale)
+            xcos_obs, xsin_obs = self.spectral.forward(dbrdt_obs.reshape(self.shape), lmax_large_scale)
+            dbrdt_large_scale = self.spectral.backward(xcos, xsin, lmax_large_scale)
+            dbrdt_large_scale_obs = self.spectral.backward(xcos_obs, xsin_obs, lmax_large_scale)
             
-            loss = self.losses["dbrdt_large_scale"] * (dbrdt_large_scale_obs - dbrdt_large_scale).pow(2).mean() / dbrdt_large_scale_obs.pow(2).mean()
+            int_Δdbrdt = ((dbrdt_large_scale_obs - dbrdt_large_scale).pow(2) * dΩ).sum(dim=[1,2])
+            int_dbrdt = (dbrdt_large_scale_obs.pow(2) * dΩ).sum(dim=[1,2])
+            
+            loss = self.losses["dbrdt_large_scale"] * (int_Δdbrdt / int_dbrdt).mean()
             self.history["dbrdt_large_scale"].append(loss.detach().numpy())
-            total_loss += loss
-        
-        # Computing L = (br_obs - br_pred)² / br_obs²
-        if "br" in self.losses:
-            loss = self.losses["br"] * (br_obs - br).pow(2).mean() / br_obs.pow(2).mean()
-            self.history["br"].append(loss.detach().numpy())
             total_loss += loss
 
         if "br_large_scale" in self.losses:
-            xcos, xsin = self.spectral.forward(br.reshape(self.shape), 13)
-            xcos_obs, xsin_obs = self.spectral.forward(br_obs.reshape(self.shape), 13)
-            br_large_scale = self.spectral.backward(xcos, xsin, 13).reshape((-1, 1))
-            br_large_scale_obs = self.spectral.backward(xcos_obs, xsin_obs, 13).reshape((-1, 1))
+            xcos, xsin = self.spectral.forward(br.reshape(self.shape), lmax_large_scale)
+            xcos_obs, xsin_obs = self.spectral.forward(br_obs.reshape(self.shape), lmax_large_scale)
+            br_large_scale = self.spectral.backward(xcos, xsin, lmax_large_scale)
+            br_large_scale_obs = self.spectral.backward(xcos_obs, xsin_obs, lmax_large_scale)
             
-            loss = self.losses["br_large_scale"] * (br_large_scale_obs - br_large_scale).pow(2).mean() / br_large_scale_obs.pow(2).mean()
+            int_Δbr = ((br_large_scale_obs - br_large_scale).pow(2) * dΩ).sum(dim=[1,2])
+            int_br = (br_large_scale_obs.pow(2) * dΩ).sum(dim=[1,2])
+            
+            loss = self.losses["br_large_scale"] * (int_Δbr / int_br).mean()
             self.history["br_large_scale"].append(loss.detach().numpy())
             total_loss += loss
 
-        # Computing L = ∫ ∇h·(uh cos²θ) dΩ
-        if "geostrophy" in self.losses:
-            dθ = numpy.gradient(self.grid["thetas"])[0]
-            dφ = numpy.gradient(self.grid["phis"])[0]
-            dΩ = sinθ * dθ * dφ
+        if "tangential_geostrophy" in self.losses:
+            TG_integral = ((cosθ * divh_uh - sinθ * uθ / rC).reshape(self.shape).pow(2) * dΩ).sum(dim=[1,2]) / torch.sum(dΩ, dim=[1, 2])
             
-            loss = self.losses["geostrophy"] * ((cosθ * divh_uh - sinθ * uθ / rC).pow(2) * dΩ).sum()
-            self.history["geostrophy"].append(loss.detach().numpy())
-            total_loss += loss
-
-        if "spectrum_br" in self.losses:
-            Sb_obs = self.spectral.spectrum([br_obs.reshape(self.shape)], 30, "spectrum_br")
-            Sb_pred = self.spectral.spectrum([br.reshape(self.shape)], 30, "spectrum_br")
-            
-            loss = self.losses["spectrum_br"] * ((Sb_obs[1:] - Sb_pred[1:]) / Sb_obs[1:]).pow(2).mean()
-            self.history["spectrum_br"].append(loss.detach().numpy())
-            total_loss += loss
-
-        if "spectrum_dbrdt" in self.losses:
-            Sdb_obs = self.spectral.spectrum([dbrdt_obs.reshape(self.shape)], 30, "spectrum_dbrdt")
-            Sdb_pred = self.spectral.spectrum([dbrdt.reshape(self.shape)], 30, "spectrum_dbrdt")
-            
-            loss = self.losses["spectrum_dbrdt"] * ((Sdb_obs[1:] - Sdb_pred[1:]) / Sdb_obs[1:]).pow(2).mean()
-            self.history["spectrum_dbrdt"].append(loss.detach().numpy())
+            loss = self.losses["tangential_geostrophy"] * TG_integral.mean()
+            self.history["tangential_geostrophy"].append(loss.detach().numpy())
             total_loss += loss
 
         if "ΔBr" in self.losses:
             xcos, xsin = self.spectral.forward(dbrdτ.reshape(self.shape), 13)
-            dbrdτ_large_scale = (self.spectral.backward(xcos, xsin, 13) * self.scale_times).reshape((-1, 1))
+            dbrdτ_large_scale = self.spectral.backward(xcos, xsin, 13) * factor_τ
 
-            xcos_obs, xsin_obs = self.spectral.forward(dbrdt.reshape(self.shape), 13)
-            dbrdt_large_scale_obs = self.spectral.backward(xcos_obs, xsin_obs, 13).reshape((-1, 1))
+            xcos_obs, xsin_obs = self.spectral.forward(dbrdt_obs.reshape(self.shape), 13)
+            dbrdt_large_scale_obs = self.spectral.backward(xcos_obs, xsin_obs, 13)
 
-            loss = self.losses["ΔBr"] * (dbrdτ_large_scale - dbrdt_large_scale_obs).pow(2).mean() / dbrdt_large_scale_obs.pow(2).mean()
+            int_Δdbrdt = ((dbrdt_large_scale_obs - dbrdτ_large_scale).pow(2) * dΩ).sum(dim=[1,2])
+            int_dbrdt = (dbrdt_large_scale_obs.pow(2) * dΩ).sum(dim=[1,2])
+
+            loss = self.losses["ΔBr"] * (int_Δdbrdt / int_dbrdt).mean()
             self.history["ΔBr"].append(loss.detach().numpy())
+            total_loss += loss
+
+        if "periodicity" in self.losses:
+            uθ_r = uθ.reshape(self.shape)
+            uφ_r = uφ.reshape(self.shape)
+            br_r = br.reshape(self.shape)
+            dbrdt_r = dbrdt.reshape(self.shape)
+
+            # Periodicity on fields
+            loss_periodicity_uθ = (uθ_r[...,0] - uθ_r[...,-1]).pow(2).mean() / uθ_r[...,0].pow(2).mean()
+            loss_periodicity_uφ = (uφ_r[...,0] - uφ_r[...,-1]).pow(2).mean() / uφ_r[...,0].pow(2).mean()
+            loss_periodicity_br = (br_r[...,0] - br_r[...,-1]).pow(2).mean() / br_r[...,0].pow(2).mean()
+            loss_periodicity_dbrdt = (dbrdt_r[...,0] - dbrdt_r[...,-1]).pow(2).mean() / dbrdt_r[...,0].pow(2).mean()
+
+            divhuh_r = divh_uh.reshape(self.shape)
+            gradθbr_r = gradθ_br.reshape(self.shape)
+            gradφbr_r = gradφ_br.reshape(self.shape)
+            
+            # Periodicity on derivatives
+            loss_periodicity_divhuh = (divhuh_r[...,0] - divhuh_r[...,-1]).pow(2).mean() / divhuh_r[...,0].pow(2).mean()
+            loss_periodicity_gradθbr = (gradθbr_r[...,0] - gradθbr_r[...,-1]).pow(2).mean() / gradθbr_r[...,0].pow(2).mean()
+            loss_periodicity_gradφbr = (gradφbr_r[...,0] - gradφbr_r[...,-1]).pow(2).mean() / gradφbr_r[...,0].pow(2).mean()
+            
+            loss = self.losses["periodicity"] * (loss_periodicity_uθ + loss_periodicity_uφ + loss_periodicity_br + loss_periodicity_dbrdt)
+            loss += self.losses["periodicity"] * (loss_periodicity_divhuh + loss_periodicity_gradθbr + loss_periodicity_gradφbr)
+            self.history["periodicity"].append(loss.detach().numpy())
+            total_loss += loss
+
+        if "strong_norm" in self.losses:
+
+            d2uθdθ2 = self._autograd(duθdθ, [θ])[0]
+            d2uθdφ2 = self._autograd(duθdφ, [φ])[0]
+            d2uφdθ2 = self._autograd(duφdθ, [θ])[0]
+            d2uφdφ2 = self._autograd(duφdφ, [φ])[0]
+
+            Δuθ = (1 / (rC**2 * sinθ)) * (cosθ * duθdθ * factor_θ + sinθ * d2uθdθ2 * factor_θ**2) + \
+                (1 / (rC * sinθ)**2) * d2uθdφ2 * factor_φ**2
+            
+            Δuφ = (1 / (rC**2 * sinθ)) * (cosθ * duφdθ * factor_θ + sinθ * d2uφdθ2 * factor_θ**2) + \
+                (1 / (rC * sinθ)**2) * d2uφdφ2 * factor_φ**2
+            
+            strong_norm = ((Δuθ.reshape(self.shape).pow(2) + Δuφ.reshape(self.shape).pow(2)) * dΩ).sum(dim=[1,2]) / (4 * torch.pi)
+
+            loss = self.losses["strong_norm"] * strong_norm.mean()
+            self.history["strong_norm"].append(loss.detach().numpy())
+            total_loss += loss
+
+        if "weak_norm" in self.losses:
+            weak_norm = ((uθ.reshape(self.shape).pow(2) + uφ.reshape(self.shape).pow(2)) * dΩ).sum(dim=[1,2]) / (4 * torch.pi)
+
+            loss = self.losses["weak_norm"] * weak_norm.mean()
+            self.history["weak_norm"].append(loss.detach().numpy())
             total_loss += loss
 
         if evaluate:
